@@ -126,11 +126,15 @@ jobs:
           npm ci
           npm run build
 
+      # 数据分块：合并图切为内容寻址小文件（graph/chunks/ + graph/index.json），
+      # 前端按块强缓存，数据变化只重拉变化的块；同时输出单文件 graph.json 兼容旧版
+      - name: Split graph into content-addressed chunks
+        run: node scripts/chunk-graph.mjs graph.json dist
+
       - name: Assemble static artifact
         run: |
           mkdir -p dist
           cp index.html style.css main.bundle.js dist/
-          node scripts/slim-graph.mjs graph.json dist/graph.json
           touch dist/.nojekyll
           cp -r covers dist/
 

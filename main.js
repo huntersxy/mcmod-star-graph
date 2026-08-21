@@ -70,6 +70,8 @@ function drawNodeLabel(context, data, settings) {
 
 // 图数据路径固定为 graph.json；可用服务器参数 --data 映射其他文件（见 server.py）
 const GRAPH_URL = "graph.json";
+const GRAPH_INDEX_URL = "graph/index.json";
+const GRAPH_CHUNK_CONCURRENCY = 8;
 const LOCAL_SERVER_ORIGINS = ["http://127.0.0.1:1119", "http://localhost:1119"];
 
 const PALETTE = [
@@ -267,6 +269,100 @@ async function loadGraph(source = null) {
   const res = await fetch(url, { cache: "no-cache" });
   if (!res.ok) throw new Error("加载 graph.json 失败: " + res.status);
   return res.json();
+}
+
+// ==================== 图数据分块加载（内容寻址强缓存） ====================
+//
+// CI 把合并图切分为多个小文件（graph/chunks/<hash>.json，文件名 = 内容哈希）
+// 并输出轻量索引 graph/index.json。加载策略与封面强缓存一致：
+//   索引 → no-cache 复验证（1 个轻量请求，感知数据更新）；
+//   数据块 → Cache API 按哈希强缓存，命中零网络请求；
+//   数据局部变化 → 只有哈希变化的块需要重拉。
+// 索引不存在（旧版部署）时回退单文件 graph.json。
+const GRAPH_DATA_CACHE_NAME = "star-graph-data-v1";
+let graphDataCachePromise = null;
+const graphChunkMemo = new Map(); // 块哈希 -> Promise<解析后的块数据>
+
+function openGraphDataCache() {
+  if (!staticCoverCacheSupported()) return Promise.resolve(null);
+  if (!graphDataCachePromise) {
+    graphDataCachePromise = caches.open(GRAPH_DATA_CACHE_NAME).catch(() => null);
+  }
+  return graphDataCachePromise;
+}
+
+function graphChunkUrl(hash) {
+  return new URL(`graph/chunks/${hash}.json`, document.baseURI).href;
+}
+
+function loadGraphChunk(hash) {
+  if (graphChunkMemo.has(hash)) return graphChunkMemo.get(hash);
+  const url = graphChunkUrl(hash);
+  const task = (async () => {
+    const cache = await openGraphDataCache();
+    if (cache) {
+      const hit = await cache.match(url).catch(() => null);
+      if (hit) return hit.json();
+    }
+    const res = await fetch(url);
+    if (!res.ok) throw new Error("chunk " + hash + " HTTP " + res.status);
+    const copy = res.clone();
+    const data = await res.json();
+    if (cache) {
+      try { await cache.put(url, copy); } catch { /* 配额不足等：不缓存但本次仍可用 */ }
+    }
+    return data;
+  })();
+  graphChunkMemo.set(hash, task.catch((error) => {
+    graphChunkMemo.delete(hash);
+    throw error;
+  }));
+  return task;
+}
+
+// 清扫索引中已不存在的块（数据集缩减 / 分桶升档后的陈旧条目）
+async function sweepGraphChunkCache(index) {
+  const cache = await openGraphDataCache();
+  if (!cache) return;
+  const wanted = new Set((index.chunks || []).map(graphChunkUrl));
+  const keys = await cache.keys().catch(() => []);
+  for (const request of keys) {
+    if (!wanted.has(request.url)) cache.delete(request).catch(() => {});
+  }
+}
+
+// 返回合并后的 { meta, nodes, edges }；索引不可用时返回 null（调用方回退单文件）
+async function loadChunkedGraph(onProgress) {
+  const res = await fetch(GRAPH_INDEX_URL, { cache: "no-cache" });
+  if (!res.ok) return null;
+  const index = await res.json();
+  if (!index || !Array.isArray(index.chunks) || !index.chunks.length) return null;
+  sweepGraphChunkCache(index); // 异步清扫，不阻塞加载
+
+  const nodes = [];
+  const edges = [];
+  const seenNode = new Set();
+  const seenEdge = new Set();
+  const hashes = index.chunks;
+  let cursor = 0;
+  let done = 0;
+  async function worker() {
+    while (cursor < hashes.length) {
+      const chunk = await loadGraphChunk(hashes[cursor++]);
+      for (const n of chunk.nodes || []) {
+        const k = String(n.key);
+        if (!seenNode.has(k)) { seenNode.add(k); nodes.push(n); }
+      }
+      for (const e of chunk.edges || []) {
+        const id = e.source + "\u0000" + e.target + "\u0000" + e.type;
+        if (!seenEdge.has(id)) { seenEdge.add(id); edges.push(e); }
+      }
+      done += 1;
+      if (onProgress) onProgress(done, hashes.length);
+    }
+  }
+  await Promise.all(Array.from({ length: Math.min(GRAPH_CHUNK_CONCURRENCY, hashes.length) }, worker));
+  return { meta: index.meta || {}, nodes, edges };
 }
 
 function normalizeCoverUrl(value) {
@@ -991,8 +1087,16 @@ function main() {
     } else {
       showToast("未连接本地 server.py，使用在线静态数据。", "warning");
       setProgress(5, "加载在线数据……", GRAPH_URL);
-      data = await loadGraph();
-      setProgress(10, "加载静态封面清单……", "covers/manifest.json");
+      // 分块优先：索引复验证 + 内容寻址块强缓存；旧版部署回退单文件
+      try {
+        data = await loadChunkedGraph((done, total) => {
+          setProgress(5 + Math.round((done / total) * 60), "加载数据块 " + done + " / " + total + "……", "graph/chunks/");
+        });
+      } catch (error) {
+        data = null; // 个别块下载失败时回退单文件路径
+      }
+      if (!data) data = await loadGraph();
+      setProgress(70, "加载静态封面清单……", "covers/manifest.json");
       await new Promise((r) => setTimeout(r, 30));
       // 封面：CI 预生成后随站点静态发布；清单缺失时回退为纯色节点。
       coverMap = await loadCoverManifest();

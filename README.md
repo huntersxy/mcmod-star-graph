@@ -43,7 +43,16 @@ python server.py [--data 文件] [--mode enhanced|upstream] [端口] [host] [cle
 - **命中即零请求**：已看过的封面完全从本地缓存取回，不向服务器发起任何请求（不受 HTTP 缓存 max-age 过期影响）。
 - **版本化失效**：CI 在封面清单中为每张封面写入版本号（来源 URL 哈希）。封面未变 → 缓存键不变 → 永不重复请求；封面更新或移除 → 启动时自动清扫旧条目并按需重拉一次。
 - 导出 PNG 使用的原图同样走该缓存；浏览器不支持 Cache API 时自动回退为普通加载。
-- `graph.json` 与清单本身仍以 ETag 304 复验证（各 1 个轻量请求），保证 CI 数据更新能及时生效。
+
+### 图数据分块加载
+
+CI 把合并后的图切分为多个内容寻址的小文件加载，避免单文件随数据集增长无界膨胀：
+
+- `graph/chunks/<hash>.json`：数据块（节点 + 边），文件名 = 内容 SHA-1。节点按 `sha1(key)` 高位稳定分桶，边跟随 source 节点，因此数据局部变化只影响对应的少数块。
+- `graph/index.json`：轻量索引（meta + 全部块哈希），每次访问以 ETag 304 复验证——这是感知数据更新的唯一必需请求。
+- 前端对数据块使用与封面相同的 Cache API 强缓存：**数据不变 → 零下载；局部变化 → 只重拉哈希变化的块**。
+- 同时输出单文件 `graph.json` 作为旧版前端回退；本地 `server.py --data` 工作流仍使用单文件。
+- 桶数按数据量自动升档（64 → 1024 → 16384，目标每块约 1MB）；升档等价于一次全量重拉，仅在数据增长约 16 倍时发生。
 
 ## 开发与构建
 
@@ -65,7 +74,7 @@ npm run build     # esbuild 打包 + 压缩 + sourcemap → main.bundle.js
 | `scripts/merge-release-graphs.mjs` | CI：合并上游全部 release 数据包为 `graph.json` |
 | `scripts/prepare-covers.mjs` | CI：按清单增量下载封面到 `covers/` |
 | `scripts/prepare-thumbs.mjs` | CI：生成 96px 展示缩略图到 `covers/small/` |
-| `scripts/slim-graph.mjs` | CI：部署期剥离前端未用字段、截断坐标精度，减小传输体积 |
+| `scripts/chunk-graph.mjs` | CI：部署期把合并图瘦身并切为内容寻址数据块 + 索引（附单文件兼容输出） |
 | `scripts/download-covers-local.mjs` | server.py 后台批量保存封面的 Node 快速路径 |
 | `.github/workflows/deploy-pages.yml` | CI：合并数据 → 增量封面 → 构建前端 → 发布 GitHub Pages |
 
