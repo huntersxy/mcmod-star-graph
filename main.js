@@ -152,6 +152,25 @@ function formatDuration(ms) {
   return m + "m" + r + "s";
 }
 
+function renderMetaPanel(meta) {
+  const el = document.getElementById("panel-meta");
+  if (!el || !meta) return;
+  const rows = [
+    ["标题", meta.title],
+    ["节点", meta.node_count],
+    ["边", meta.edge_count],
+    ["核心节点", meta.core_node_count],
+    ["依赖边", meta.dependency_edges],
+    ["联动边", meta.interaction_edges],
+    ["社区", meta.community_count],
+    ["连通分量", meta.component_count],
+    ["生成时间", meta.generated_at],
+  ].filter((row) => row[1] != null && row[1] !== "");
+  const html = '<div class="meta-title">图元数据</div>' +
+    rows.map((row) => '<div class="meta-row"><span>' + row[0] + '</span><b>' + String(row[1]) + '</b></div>').join("");
+  el.innerHTML = html;
+}
+
 function edgeColorFor(rgb, alpha) {
   return premulRgba(rgb, EDGE_ALPHA * alpha);
 }
@@ -890,6 +909,7 @@ function main() {
       // 封面：CI 预生成后随站点静态发布；清单缺失时回退为纯色节点。
       coverMap = await loadCoverManifest();
     }
+    renderMetaPanel(data.meta);
     setProgress(20, coverMap.size
       ? "构建图结构……"
       : "未找到封面，使用纯色节点……", coverMap.size + " 张封面已就绪");
@@ -1152,11 +1172,15 @@ function main() {
 
   function bindEvents() {
     renderer.on("enterNode", ({ node }) => {
+      hoveredNode = node;
+      if (altLock) return;
       const attrs = graph.getNodeAttributes(node);
       showTooltip(node, attrs);
     });
 
     renderer.on("leaveNode", () => {
+      hoveredNode = null;
+      if (altLock) return;
       hideTooltip();
     });
 
@@ -1412,6 +1436,7 @@ function main() {
   }
 
   function positionTooltip() {
+    if (altLock) return;
     const pad = 12;
     const w = tooltipEl.offsetWidth;
     const h = tooltipEl.offsetHeight;
@@ -1424,9 +1449,36 @@ function main() {
   }
 
   let lastMouse = { x: 0, y: 0 };
+  let hoveredNode = null;
+  let altLock = false;
+  let lastAltPress = 0;
+  const ALT_DOUBLE_MS = 300;
+
   window.addEventListener("mousemove", (e) => {
     lastMouse = { x: e.clientX, y: e.clientY };
     if (!tooltipEl.classList.contains("hidden")) positionTooltip();
+  });
+
+  window.addEventListener("keydown", (e) => {
+    if (e.key === "Alt") {
+      e.preventDefault();
+      altLock = true;
+      const now = performance.now();
+      if (now - lastAltPress < ALT_DOUBLE_MS) {
+        lastAltPress = 0;
+        if (panel.classList.contains("collapsed") || panel.style.display === "none") {
+          panel.style.display = panel.style.display === "none" ? "" : "none";
+        }
+      } else {
+        lastAltPress = now;
+      }
+    }
+  });
+  window.addEventListener("keyup", (e) => {
+    if (e.key === "Alt") {
+      altLock = false;
+      if (!hoveredNode) hideTooltip();
+    }
   });
 
   document.addEventListener("click", (e) => {

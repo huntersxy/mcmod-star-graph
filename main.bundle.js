@@ -8098,6 +8098,23 @@ function formatDuration(ms) {
   const r = s % 60;
   return m + "m" + r + "s";
 }
+function renderMetaPanel(meta) {
+  const el = document.getElementById("panel-meta");
+  if (!el || !meta) return;
+  const rows = [
+    ["\u6807\u9898", meta.title],
+    ["\u8282\u70B9", meta.node_count],
+    ["\u8FB9", meta.edge_count],
+    ["\u6838\u5FC3\u8282\u70B9", meta.core_node_count],
+    ["\u4F9D\u8D56\u8FB9", meta.dependency_edges],
+    ["\u8054\u52A8\u8FB9", meta.interaction_edges],
+    ["\u793E\u533A", meta.community_count],
+    ["\u8FDE\u901A\u5206\u91CF", meta.component_count],
+    ["\u751F\u6210\u65F6\u95F4", meta.generated_at]
+  ].filter((row) => row[1] != null && row[1] !== "");
+  const html = '<div class="meta-title">\u56FE\u5143\u6570\u636E</div>' + rows.map((row) => '<div class="meta-row"><span>' + row[0] + "</span><b>" + String(row[1]) + "</b></div>").join("");
+  el.innerHTML = html;
+}
 function edgeColorFor(rgb, alpha) {
   return premulRgba(rgb, EDGE_ALPHA * alpha);
 }
@@ -8803,6 +8820,7 @@ function main() {
       await new Promise((r) => setTimeout(r, 30));
       coverMap = await loadCoverManifest();
     }
+    renderMetaPanel(data.meta);
     setProgress(20, coverMap.size ? "\u6784\u5EFA\u56FE\u7ED3\u6784\u2026\u2026" : "\u672A\u627E\u5230\u5C01\u9762\uFF0C\u4F7F\u7528\u7EAF\u8272\u8282\u70B9\u2026\u2026", coverMap.size + " \u5F20\u5C01\u9762\u5DF2\u5C31\u7EEA");
     await new Promise((r) => setTimeout(r, 30));
     const built = buildGraph(data, coverMap, eagerImages);
@@ -9027,10 +9045,14 @@ function main() {
   }
   function bindEvents() {
     renderer.on("enterNode", ({ node }) => {
+      hoveredNode = node;
+      if (altLock) return;
       const attrs = graph.getNodeAttributes(node);
       showTooltip(node, attrs);
     });
     renderer.on("leaveNode", () => {
+      hoveredNode = null;
+      if (altLock) return;
       hideTooltip();
     });
     renderer.on("clickNode", ({ node }) => {
@@ -9249,6 +9271,7 @@ function main() {
     tooltipEl.classList.add("hidden");
   }
   function positionTooltip() {
+    if (altLock) return;
     const pad = 12;
     const w = tooltipEl.offsetWidth;
     const h = tooltipEl.offsetHeight;
@@ -9260,9 +9283,34 @@ function main() {
     tooltipEl.style.top = y + "px";
   }
   let lastMouse = { x: 0, y: 0 };
+  let hoveredNode = null;
+  let altLock = false;
+  let lastAltPress = 0;
+  const ALT_DOUBLE_MS = 300;
   window.addEventListener("mousemove", (e) => {
     lastMouse = { x: e.clientX, y: e.clientY };
     if (!tooltipEl.classList.contains("hidden")) positionTooltip();
+  });
+  window.addEventListener("keydown", (e) => {
+    if (e.key === "Alt") {
+      e.preventDefault();
+      altLock = true;
+      const now = performance.now();
+      if (now - lastAltPress < ALT_DOUBLE_MS) {
+        lastAltPress = 0;
+        if (panel.classList.contains("collapsed") || panel.style.display === "none") {
+          panel.style.display = panel.style.display === "none" ? "" : "none";
+        }
+      } else {
+        lastAltPress = now;
+      }
+    }
+  });
+  window.addEventListener("keyup", (e) => {
+    if (e.key === "Alt") {
+      altLock = false;
+      if (!hoveredNode) hideTooltip();
+    }
   });
   document.addEventListener("click", (e) => {
     if (!contextMenu.contains(e.target)) hideContextMenu();
