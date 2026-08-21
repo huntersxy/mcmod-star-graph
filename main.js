@@ -10,12 +10,14 @@
  */
 import Graph from "graphology";
 import Sigma from "sigma";
-import { NodeImageProgram } from "@sigma/node-image";
+import { createNodeImageProgram } from "@sigma/node-image";
 
 // 支持封面透明度淡入淡出的图像节点程序。
 // sigma 使用预乘 alpha 混合（blendFunc(ONE, ONE_MINUS_SRC_ALPHA)），
 // 因此颜色 RGB 必须先乘以 alpha，否则降低 alpha 会变成加色混合（变亮）而不是变透明。
-class FadingNodeImageProgram extends NodeImageProgram {
+// 经工厂创建并把纹理批处理去抖加长到 1500ms：每批新封面只触发一次
+// 全量刷新写入图集坐标（默认 500ms 在大图上会造成周期性掉帧）。
+class FadingNodeImageProgram extends createNodeImageProgram({ debounceTimeout: 1500 }) {
   getDefinition() {
     const def = super.getDefinition();
     def.FRAGMENT_SHADER_SOURCE = def.FRAGMENT_SHADER_SOURCE
@@ -732,7 +734,10 @@ function buildGraph(data, coverMap, eagerImages = false) {
       kind: n.type,
       // 初始只保留封面 URL；节点进入视口并由调度器加载成功后才切换 image。
       // 已加载节点不会被切回 circle，因此离开/重新进入视口不会重复请求。
-      type: eagerImages && cover ? "image" : "circle",
+      // 封面节点从一开始就是 image 类型：无图时 shader 自动回退为纯色圆
+      // （v_texture.w <= 0 分支），封面就绪后只更新 image 属性。这样避免
+      // circle→image 的渲染程序切换，封面批次才能走廉价的局部刷新。
+      type: cover ? "image" : "circle",
       image: eagerImages && cover ? cover.thumb : null,
       thumb: cover ? cover.thumb : null,
       imageSrc: cover ? cover.orig : null, // 原图（导出大图用）
@@ -1034,7 +1039,8 @@ function main() {
   let outOfViewNodes = new Set();
   // 隐藏项的 reducer 结果缓存：全量刷新时绝大多数节点/边处于隐藏态，
   // 逐项展开新对象会造成每次刷新 ~9 万次对象分配的 GC 风暴。隐藏项不
-  // 渲染，复用同一对象安全；节点属性变化处（封面加载）显式失效。
+  // 渲染，且节点渲染类型恒定（封面节点始终 image、无图回退纯色），
+  // 复用同一对象安全。
   const hiddenNodeData = new Map();
   const hiddenEdgeData = new Map();
   let nodeVisibleCount = 0;
@@ -1273,9 +1279,6 @@ function main() {
       if (!pendingCoverUpdates.size) return;
       const updates = new Map(pendingCoverUpdates);
       pendingCoverUpdates.clear();
-      // 节点类型即将 circle→image，隐藏缓存中的旧对象必须失效，
-      // 否则全量刷新会把节点排进错误的渲染程序
-      for (const key of updates.keys()) hiddenNodeData.delete(key);
       graph.updateEachNodeAttributes(
         (key, attrs) => {
           const objectUrl = updates.get(key);
@@ -1283,7 +1286,14 @@ function main() {
         },
         { attributes: ["image", "type"] },
       );
-      renderer.refresh();
+      // 节点类型恒为 image（无图回退纯色），可安全走局部刷新；类型若会
+      // circle→image 切换则必须全量刷新（渲染程序槽位会重新分配）。
+      // 纹理真正就绪后 node-image 程序会自行触发一次带去抖的全量刷新。
+      renderer.refresh({
+        partialGraph: { nodes: [...updates.keys()] },
+        skipIndexation: true,
+        schedule: true,
+      });
     }
 
     function queueCoverImageUpdate(key, imageSource) {
@@ -1346,7 +1356,7 @@ function main() {
       const maxY = rect.maxY + marginGraph;
       const visible = new Set();
       graph.forEachNode((key, attrs) => {
-        if (!attrs.thumb || attrs.type === "image") return;
+        if (!attrs.thumb) return;
         // 图空间包围盒预筛（纯数值比较，无矩阵调用）
         if (attrs.x < minX || attrs.x > maxX || attrs.y < minY || attrs.y > maxY) return;
         // 节点太小或当前被 LoD 隐藏时不联网；放大/重新出现后会再次排队。
@@ -1375,10 +1385,13 @@ function main() {
 
     function scheduleCoverLoadsSoon() {
       if (coverScheduleTimer) return;
-      coverScheduleTimer = requestAnimationFrame(() => {
+      // 相机移动（拖动/缩放/动画）期间不启动新的封面加载——加载瞬态视口
+      // 的封面是纯浪费，且加载-纹理-刷新链路会与移动渲染争抢主线程。
+      // 相机静止 300ms 后再调度当前视口。
+      coverScheduleTimer = setTimeout(() => {
         coverScheduleTimer = null;
         scheduleCoverLoads();
-      });
+      }, 300);
     }
 
     let lodLastRun = 0;
