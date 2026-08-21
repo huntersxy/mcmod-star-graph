@@ -1,7 +1,7 @@
 /*
- * star_graph/main.js - NeoForge 1.21.1 生态关系图前端
+ * star_graph/main.js - MC 百科星图前端
  *
- * 基于 sigma.js v3 + graphology，数据来自 graph.json（GitHub Releases 分发）。
+ * 基于 sigma.js v3 + graphology，数据来自 graph.json / graph/chunks（GitHub Releases 分发）。
  * 封面由 CI 从 MC 百科预生成到 covers/，随站点静态发布；纯前端运行，
  * 可独立运行；检测到本地 server.py 时支持本地图数据与本地封面下载。
  *
@@ -247,6 +247,16 @@ function renderMetaPanel(meta) {
   const html = '<div class="meta-title">图元数据</div>' +
     rows.map((row) => '<div class="meta-row"><span>' + row[0] + '</span><b>' + String(row[1]) + '</b></div>').join("");
   el.innerHTML = html;
+}
+
+// 站点标题跟随数据集标题（数据 meta 的 title），避免 HTML 静态文案与
+// 实际加载的数据不一致；meta 缺失时保留 index.html 的静态默认值。
+function applyDataTitle(meta) {
+  const title = meta && meta.title;
+  if (!title) return;
+  document.title = title;
+  const el = document.querySelector(".panel-title");
+  if (el) el.textContent = title;
 }
 
 function edgeColorFor(rgb, alpha) {
@@ -1103,6 +1113,7 @@ function main() {
       sweepStaticCoverCache(coverMap);
     }
     renderMetaPanel(data.meta);
+    applyDataTitle(data.meta);
     setProgress(20, coverMap.size
       ? "构建图结构……"
       : "未找到封面，使用纯色节点……", coverMap.size + " 张封面已就绪");

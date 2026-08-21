@@ -126,7 +126,7 @@ const mergedAt = new Date().toISOString();
 const graph = {
   meta: {
     // 前端 renderMetaPanel 读取的展示字段（来自最新 release 的标题 + 合并统计）
-    title: latestMeta?.title || "NeoForge 1.21.1 生态关系图",
+    title: latestMeta?.title || "MC百科星图",
     node_count: mergedNodes.length,
     edge_count: mergedEdges.length,
     core_node_count: coreNodeCount,
