@@ -111,7 +111,7 @@ function rgbaString(rgb, alpha) {
 // 边 LoD：ratio 越大（缩到最小）阈值越高，只留骨干边
 const LOD_MAX_THRESHOLD = 50;
 const LOD_FULL_ZOOM_RATIO = 0.05;
-const LOD_THROTTLE_MS = 33;
+const LOD_THROTTLE_MS = 50;
 const NODE_LOD_MIN_VISIBLE = 300;
 const NODE_LOD_ENABLED = true;
 const NODE_DIAMETER_SCREEN_RATIO = 0.1; // 跳转后节点直径占屏幕宽度的比例
@@ -1031,6 +1031,12 @@ function main() {
   let lodThresholdValue = 0;
   let lodTimer = null;
   let culledEdges = new Set();
+  let outOfViewNodes = new Set();
+  // 隐藏项的 reducer 结果缓存：全量刷新时绝大多数节点/边处于隐藏态，
+  // 逐项展开新对象会造成每次刷新 ~9 万次对象分配的 GC 风暴。隐藏项不
+  // 渲染，复用同一对象安全；节点属性变化处（封面加载）显式失效。
+  const hiddenNodeData = new Map();
+  const hiddenEdgeData = new Map();
   let nodeVisibleCount = 0;
   let edgeAlpha = new Map();
   let nodeAlpha = new Map();
@@ -1049,6 +1055,34 @@ function main() {
     statusText.textContent = text;
     progressFill.style.width = Math.max(0, Math.min(100, pct)) + "%";
     progressLabel.textContent = label || "";
+  }
+
+  // ?fps=1 调试 HUD：滚动 FPS 与最差帧耗时（验证渲染流畅度用）
+  if (/[?&]fps=1\b/.test(location.search)) {
+    const hud = document.createElement("div");
+    hud.id = "fps-hud";
+    hud.style.cssText =
+      "position:fixed;left:8px;bottom:8px;z-index:9999;background:rgba(0,0,0,.75);" +
+      "color:#7CFC00;font:12px/1.4 monospace;padding:4px 8px;border-radius:4px;pointer-events:none;";
+    hud.textContent = "FPS --";
+    document.body.appendChild(hud);
+    let frames = 0;
+    let worst = 0;
+    let last = performance.now();
+    let prev = last;
+    const tick = (now) => {
+      frames += 1;
+      worst = Math.max(worst, now - prev);
+      prev = now;
+      if (now - last >= 500) {
+        hud.textContent = "FPS " + Math.round((frames * 1000) / (now - last)) + " · worst " + Math.round(worst) + "ms";
+        frames = 0;
+        worst = 0;
+        last = now;
+      }
+      requestAnimationFrame(tick);
+    };
+    requestAnimationFrame(tick);
   }
 
   function finishLoading() {
@@ -1133,8 +1167,12 @@ function main() {
     renderer = new Sigma(graph, container, {
       renderLabels: true,
       renderEdgeLabels: false,
-      hideEdgesOnMove: false,
-      enableEdgeEvents: true,
+      // 拖动/缩放期间跳过边渲染（6.7 万条边的 WebGL 绘制是移动卡顿主源），
+      // 相机静止后自动恢复
+      hideEdgesOnMove: true,
+      // 边命中检测走 WebGL readPixels（GPU 同步点）；开启后每次鼠标移动都会
+      // 执行一遍。改为关闭，左右键点击时手动调用 getEdgeAtPoint。
+      enableEdgeEvents: false,
       // 节点尺寸与坐标同单位（世界单位），去重叠才能与渲染一致
       itemSizesReference: "positions",
       zoomToSizeRatioFunction: (ratio) => ratio,
@@ -1174,12 +1212,20 @@ function main() {
       hideContextMenu();
     });
 
+    // 隐藏项的 reducer 结果缓存（见 main() 顶部声明）
     renderer.setSetting("edgeReducer", (edge, attrs) => {
       if (highlightEdges.has(edge)) {
         return { ...attrs, hidden: false, color: HIGHLIGHT_EDGE_COLOR, size: Math.max(attrs.size || 0.5, 1.6) };
       }
       const alpha = edgeAlpha.get(edge);
-      if (alpha === 0) return { ...attrs, hidden: true };
+      if (alpha === 0) {
+        let cached = hiddenEdgeData.get(edge);
+        if (!cached) {
+          cached = { ...attrs, hidden: true };
+          hiddenEdgeData.set(edge, cached);
+        }
+        return cached;
+      }
       if (alpha !== undefined && alpha < 1) {
         return { ...attrs, color: edgeColorFor(attrs.rgb || DEPENDENCY_EDGE_RGB, alpha) };
       }
@@ -1191,7 +1237,14 @@ function main() {
         return { ...attr, hidden: false, color: HIGHLIGHT_NODE_COLOR };
       }
       const alpha = nodeAlpha.get(node);
-      if (alpha === 0) return { ...attr, hidden: true };
+      if (alpha === 0) {
+        let cached = hiddenNodeData.get(node);
+        if (!cached) {
+          cached = { ...attr, hidden: true };
+          hiddenNodeData.set(node, cached);
+        }
+        return cached;
+      }
       if (alpha !== undefined && alpha < 1) {
         // image 节点的预乘在 FadingNodeImageProgram 的 shader 里完成，
         // circle 节点没有自定义 shader，因此在这里预乘。
@@ -1220,6 +1273,9 @@ function main() {
       if (!pendingCoverUpdates.size) return;
       const updates = new Map(pendingCoverUpdates);
       pendingCoverUpdates.clear();
+      // 节点类型即将 circle→image，隐藏缓存中的旧对象必须失效，
+      // 否则全量刷新会把节点排进错误的渲染程序
+      for (const key of updates.keys()) hiddenNodeData.delete(key);
       graph.updateEachNodeAttributes(
         (key, attrs) => {
           const objectUrl = updates.get(key);
@@ -1277,19 +1333,28 @@ function main() {
       const h = container.clientHeight;
       const margin = 320;
       if (w <= 0 || h <= 0) return;
+      const camState = renderer.getCamera().getState();
+      // 一次算好「图单位 → 屏幕像素」换算（与逐节点 scaleSize 语义一致），
+      // 之后全部用图空间矩形预筛，只有候选节点才做视口投影
+      const pxPerUnit = renderer.scaleSize(1, camState.ratio);
+      if (!Number.isFinite(pxPerUnit) || pxPerUnit <= 0) return;
+      const marginGraph = margin / pxPerUnit;
+      const rect = getViewRect(camState);
+      const minX = rect.minX - marginGraph;
+      const maxX = rect.maxX + marginGraph;
+      const minY = rect.minY - marginGraph;
+      const maxY = rect.maxY + marginGraph;
       const visible = new Set();
       graph.forEachNode((key, attrs) => {
         if (!attrs.thumb || attrs.type === "image") return;
+        // 图空间包围盒预筛（纯数值比较，无矩阵调用）
+        if (attrs.x < minX || attrs.x > maxX || attrs.y < minY || attrs.y > maxY) return;
+        // 节点太小或当前被 LoD 隐藏时不联网；放大/重新出现后会再次排队。
+        if (attrs.size * pxPerUnit < 6) return;
+        if (nodeAlpha.get(key) === 0) return;
         const state = coverState(key);
         if (state.status === "ready" || state.status === "failed" || state.status === "loading") return;
         const point = renderer.graphToViewport({ x: attrs.x, y: attrs.y });
-        const withinMargin = point.x >= -margin && point.x <= w + margin &&
-          point.y >= -margin && point.y <= h + margin;
-        if (!withinMargin) return;
-        // 节点太小或当前被 LoD 隐藏时不联网；放大/重新出现后会再次排队。
-        const screenSize = renderer.scaleSize(attrs.size);
-        if (!Number.isFinite(screenSize) || screenSize < 6) return;
-        if (nodeAlpha.get(key) === 0) return;
         visible.add(key);
         const centerDistance = Math.hypot(point.x - w / 2, point.y - h / 2);
         const insideViewport = point.x >= 0 && point.x <= w && point.y >= 0 && point.y <= h;
@@ -1392,7 +1457,20 @@ function main() {
       window.open("https://www.mcmod.cn/class/" + node + ".html", "_blank");
     });
 
-    renderer.on("clickEdge", ({ edge }) => {
+    // 左键点击边 → 聚焦较近端点。enableEdgeEvents 已关闭（避免每 mousemove
+    // 一次 readPixels），这里在点击时手动做一次命中检测；带拖动保护。
+    let pointerDownPos = null;
+    container.addEventListener("mousedown", (e) => {
+      pointerDownPos = { x: e.clientX, y: e.clientY };
+    });
+    container.addEventListener("click", (e) => {
+      if (pointerDownPos && Math.hypot(e.clientX - pointerDownPos.x, e.clientY - pointerDownPos.y) > 5) return;
+      const bbox = container.getBoundingClientRect();
+      const x = e.clientX - bbox.left;
+      const y = e.clientY - bbox.top;
+      if (renderer.getNodeAtPosition({ x, y })) return; // 节点点击由 clickNode 处理
+      const edge = renderer.getEdgeAtPoint(x, y);
+      if (!edge) return;
       const source = graph.source(edge);
       const target = graph.target(edge);
       const cam = renderer.getCamera().getState();
@@ -1519,12 +1597,17 @@ function main() {
   }
 
   function updateCulling(cameraState) {
+    // 两段式：先一次节点扫描算出视口外节点集合，边扫描只做集合查找，
+    // 避免每条边重复做坐标比较（6.7 万边 × 每相机更新）
     const rect = getViewRect(cameraState);
+    const out = new Set();
+    graph.forEachNode((node, attrs) => {
+      if (attrs.x < rect.minX || attrs.x > rect.maxX || attrs.y < rect.minY || attrs.y > rect.maxY) out.add(node);
+    });
+    outOfViewNodes = out;
     const next = new Set();
-    graph.forEachEdge((edge, attrs, source, target, sa, ta) => {
-      const sOut = sa.x < rect.minX || sa.x > rect.maxX || sa.y < rect.minY || sa.y > rect.maxY;
-      const tOut = ta.x < rect.minX || ta.x > rect.maxX || ta.y < rect.minY || ta.y > rect.maxY;
-      if (sOut && tOut) next.add(edge);
+    graph.forEachEdge((edge, _attrs, source, target) => {
+      if (out.has(source) && out.has(target)) next.add(edge);
     });
     culledEdges = next;
   }
@@ -1580,44 +1663,62 @@ function main() {
     return (attrs.rank ?? Infinity) < nodeVisibleCount ? 1 : 0;
   }
 
-  function fadeStep() {
-    const step = 0.36; // 渐变时长减半
-    const changedNodes = [];
-    const changedEdges = [];
+  // 渐隐队列：只跟踪「当前 alpha ≠ 目标」的项。大图（2.7 万节点 + 6.7 万边）
+  // 全量扫描只在 LoD/剔除参数变化时做一次，动画期间每帧只处理队列中的少量项，
+  // 并用 sigma 的局部刷新避免整图重索引。
+  let fadeQueue = [];
 
+  function recomputeFadeTargets() {
+    const queue = [];
     graph.forEachEdge((edge, attrs) => {
       const target = edgeTarget(edge, attrs);
       const cur = edgeAlpha.has(edge) ? edgeAlpha.get(edge) : 1;
-      if (cur === target) return;
-      let next = cur + (target - cur) * step;
-      if (Math.abs(next - target) < 0.02) next = target;
-      if (next === 1) edgeAlpha.delete(edge);
-      else edgeAlpha.set(edge, next);
-      changedEdges.push(edge);
+      if (cur !== target) queue.push([edge, false]);
     });
-
     graph.forEachNode((node, attrs) => {
       const target = nodeTarget(node, attrs);
       const cur = nodeAlpha.has(node) ? nodeAlpha.get(node) : 1;
-      if (cur === target) return;
+      if (cur !== target) queue.push([node, true]);
+    });
+    fadeQueue = queue;
+  }
+
+  function fadeStep() {
+    fadeTimer = null;
+    const step = 0.5;
+    const changedNodes = [];
+    const changedEdges = [];
+    const remaining = [];
+    for (const [key, isNode] of fadeQueue) {
+      const map = isNode ? nodeAlpha : edgeAlpha;
+      const target = isNode
+        ? nodeTarget(key, graph.getNodeAttributes(key))
+        : edgeTarget(key, graph.getEdgeAttributes(key));
+      const cur = map.has(key) ? map.get(key) : 1;
+      if (cur === target) continue;
       let next = cur + (target - cur) * step;
       if (Math.abs(next - target) < 0.02) next = target;
-      if (next === 1) nodeAlpha.delete(node);
-      else nodeAlpha.set(node, next);
-      changedNodes.push(node);
-    });
-
-    if (changedNodes.length || changedEdges.length) {
-      renderer.refresh();
-      fadeTimer = setTimeout(fadeStep, 33);
-    } else {
-      fadeTimer = null;
+      if (next === 1) map.delete(key);
+      else map.set(key, next);
+      (isNode ? changedNodes : changedEdges).push(key);
+      if (next !== target) remaining.push([key, isNode]);
     }
+    fadeQueue = remaining;
+    if (changedNodes.length || changedEdges.length) {
+      // alpha 变化不改变节点/边的渲染类型，可安全走 skipIndexation 局部刷新；
+      // 封面 circle→image 的类型切换仍走全量刷新（见 flushCoverImageUpdates）
+      renderer.refresh({
+        partialGraph: { nodes: changedNodes, edges: changedEdges },
+        skipIndexation: true,
+        schedule: true,
+      });
+    }
+    if (fadeQueue.length) fadeTimer = setTimeout(fadeStep, 50);
   }
 
   function startFade() {
-    if (fadeTimer) return;
-    fadeStep();
+    recomputeFadeTargets();
+    if (!fadeTimer && fadeQueue.length) fadeTimer = setTimeout(fadeStep, 0);
   }
 
   function showTooltip(node, attrs) {
