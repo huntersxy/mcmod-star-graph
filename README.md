@@ -36,6 +36,39 @@ python server.py [--data 文件] [--mode enhanced|upstream] [端口] [host] [cle
 
 修改 `server.py` 顶部的 `COVER_SIZE`，然后用 `python server.py clean` 启动一次以清缓存重下。
 
+### 封面强缓存（在线模式）
+
+在线静态部署（GitHub Pages）模式下，封面使用浏览器的 Cache API 做持久强缓存：
+
+- **命中即零请求**：已看过的封面完全从本地缓存取回，不向服务器发起任何请求（不受 HTTP 缓存 max-age 过期影响）。
+- **版本化失效**：CI 在封面清单中为每张封面写入版本号（来源 URL 哈希）。封面未变 → 缓存键不变 → 永不重复请求；封面更新或移除 → 启动时自动清扫旧条目并按需重拉一次。
+- 导出 PNG 使用的原图同样走该缓存；浏览器不支持 Cache API 时自动回退为普通加载。
+- `graph.json` 与清单本身仍以 ETag 304 复验证（各 1 个轻量请求），保证 CI 数据更新能及时生效。
+
+## 开发与构建
+
+前端入口是 `main.js`（sigma.js v3 + graphology），需要先构建 bundle 再被 `index.html` 加载：
+
+```bash
+npm install       # 首次
+npm run build     # esbuild 打包 + 压缩 + sourcemap → main.bundle.js
+```
+
+修改 `main.js` 后重新运行 `npm run build` 提交新的 `main.bundle.js`（CI 部署时会现场重建，本地开发依赖仓库内的 bundle）。
+
+## 项目结构
+
+| 路径 | 说明 |
+| --- | --- |
+| `main.js` | 前端：星图渲染、搜索、LoD 显隐、封面懒加载、PNG 导出 |
+| `server.py` | 本地服务器：静态文件 + `/cover_proxy` 反代（绕 MC 百科防盗链）+ 后台批量保存封面 |
+| `scripts/merge-release-graphs.mjs` | CI：合并上游全部 release 数据包为 `graph.json` |
+| `scripts/prepare-covers.mjs` | CI：按清单增量下载封面到 `covers/` |
+| `scripts/prepare-thumbs.mjs` | CI：生成 96px 展示缩略图到 `covers/small/` |
+| `scripts/slim-graph.mjs` | CI：部署期剥离前端未用字段、截断坐标精度，减小传输体积 |
+| `scripts/download-covers-local.mjs` | server.py 后台批量保存封面的 Node 快速路径 |
+| `.github/workflows/deploy-pages.yml` | CI：合并数据 → 增量封面 → 构建前端 → 发布 GitHub Pages |
+
 ## 声明
 
 - 本项目的图数据来源于 MC 百科（mcmod.cn）公开页面，抓取日期见各 Release 说明。

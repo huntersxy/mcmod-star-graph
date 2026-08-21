@@ -113,10 +113,24 @@ jobs:
           path: covers
           key: covers-v3-${{ inputs.cover_limit || '0' }}-${{ github.sha }}
 
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      # 语法检查 + 现场构建前端 bundle：部署不依赖仓库里可能过期的 main.bundle.js
+      - name: Syntax check and build frontend
+        run: |
+          for f in scripts/*.mjs main.js; do node --check "$f"; done
+          npm ci
+          npm run build
+
       - name: Assemble static artifact
         run: |
           mkdir -p dist
-          cp index.html style.css graph.json main.bundle.js dist/
+          cp index.html style.css main.bundle.js dist/
+          node scripts/slim-graph.mjs graph.json dist/graph.json
           touch dist/.nojekyll
           cp -r covers dist/
 

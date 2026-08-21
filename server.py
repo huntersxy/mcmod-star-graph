@@ -25,6 +25,8 @@ star_graph/server.py - 本地服务器：静态文件服务 + 封面代理
     防止被当作开放代理（SSRF）。
 """
 
+from __future__ import annotations
+
 import hashlib
 import json
 import os
@@ -204,6 +206,10 @@ def _run_node_cover_download(job: Dict[str, Any], nodes: List[Dict[str, Any]], m
     input_path = COVERS_DIR / f".download.{job['id']}.json"
     input_path.write_text(json.dumps(nodes, ensure_ascii=False), encoding="utf-8")
     script_path = ROOT_DIR / "scripts" / "download-covers-local.mjs"
+    env = dict(os.environ)
+    env.setdefault("COVER_SIZE", str(COVER_SIZE))
+    if STATIC_FALLBACK_BASE:
+        env.setdefault("STATIC_FALLBACK_BASE", STATIC_FALLBACK_BASE)
     try:
         process = subprocess.Popen(
             [node_bin, str(script_path), str(input_path), str(COVERS_DIR)],
@@ -213,6 +219,7 @@ def _run_node_cover_download(job: Dict[str, Any], nodes: List[Dict[str, Any]], m
             text=True,
             encoding="utf-8",
             errors="replace",
+            env=env,
         )
         for line in process.stdout or ():
             try:
@@ -275,6 +282,9 @@ class Handler(SimpleHTTPRequestHandler):
         self.send_header("Access-Control-Allow-Origin", "*")
         self.send_header("Access-Control-Allow-Methods", "GET, OPTIONS")
         self.send_header("Access-Control-Allow-Headers", "*")
+        # 封面文件内容寻址（按 key 命名），允许浏览器缓存一天，减少本地重复读取
+        if urllib.parse.urlsplit(self.path).path.startswith("/covers/"):
+            self.send_header("Cache-Control", "public, max-age=86400")
         super().end_headers()
 
     def do_OPTIONS(self) -> None:
@@ -338,17 +348,19 @@ class Handler(SimpleHTTPRequestHandler):
                 self._send_json(400, {"error": "no cover nodes"})
                 return
             existing = set(_existing_cover_keys())
+            requested = {str(node["key"]) for node in nodes}
+            ready = existing.intersection(requested)
             pending = [node for node in nodes if str(node["key"]) not in existing]
             job_id = uuid.uuid4().hex
             job: Dict[str, Any] = {
                 "id": job_id,
                 "status": "running",
                 "total": len(nodes),
-                "done": len(existing.intersection({str(node["key"]) for node in nodes})),
+                "done": len(ready),
                 "downloaded": 0,
-                "skipped": len(existing.intersection({str(node["key"]) for node in nodes})),
+                "skipped": len(ready),
                 "failed": 0,
-                "ready_keys": sorted(existing.intersection({str(node["key"]) for node in nodes}), key=lambda value: int(value)),
+                "ready_keys": sorted(ready, key=lambda value: int(value)),
             }
             with _DOWNLOAD_LOCK:
                 _DOWNLOAD_JOBS[job_id] = job

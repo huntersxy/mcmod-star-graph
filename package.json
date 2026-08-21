@@ -4,7 +4,7 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "build": "esbuild main.js --bundle --format=esm --outfile=main.bundle.js --sourcemap"
+    "build": "esbuild main.js --bundle --format=esm --outfile=main.bundle.js --sourcemap --minify --target=es2020 --charset=utf8"
   },
   "dependencies": {
     "@sigma/node-image": "^3.0.0",

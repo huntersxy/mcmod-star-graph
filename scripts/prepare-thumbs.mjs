@@ -77,6 +77,8 @@ if (!keys.length) {
   console.log("[thumbs] 清单为空，跳过");
   process.exit(0);
 }
+// 封面版本号从 covers/manifest.json 透传，前端用它做 Cache API 强缓存键
+const manifestItems = manifest.items && typeof manifest.items === "object" ? manifest.items : {};
 
 let previous = {};
 try {
@@ -127,6 +129,8 @@ for (const key of keys) {
   const st = await statOrNull(path.join(smallDir, `${key}.png`));
   if (st) {
     items[key] = { path: `covers/small/${key}.png`, orig: `covers/${key}.jpg`, bytes: st.size };
+    const v = manifestItems[key] && manifestItems[key].v;
+    if (v) items[key].v = v;
   }
 }
 const outKeys = Object.keys(items).sort((a, b) => Number(a) - Number(b));

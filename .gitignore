@@ -7,7 +7,6 @@ graph*.json
 release/
 releasing/
 graph/
-covers/
 
 # CI 生成的封面与合并缓存（release 资产缓存、封面、dist 均随站点发布不入库）
 /covers/

@@ -126,6 +126,82 @@ const COVER_LOAD_CONCURRENCY = 24; // 缓存解码并发；真正联网仍由网
 const COVER_LOAD_RETRIES = 2;
 const COVER_NETWORK_INTERVAL_MS = 150; // 仅网络请求之间的间隔；缓存命中不等待
 
+// ==================== 静态封面强缓存（Cache API） ====================
+//
+// 在线静态模式（GitHub Pages）下的封面持久缓存：命中时完全本地取回，
+// 不向服务器发起任何请求；未命中才 fetch 并写入缓存。
+// 缓存键 = 封面 URL + 版本号（v，封面来源 URL 的哈希，由 CI 写入清单）：
+//   封面未变 → 键不变 → 永不重复请求；
+//   封面更新 / 移除 → 键变化或清单缺失 → 启动清扫删除旧条目，按需重拉。
+// 浏览器不支持 Cache API（如 file:// 协议）时自动回退为直连加载。
+const STATIC_COVER_CACHE_NAME = "star-graph-static-covers-v1";
+let staticCoverCachePromise = null;
+const staticCoverMemo = new Map(); // 缓存键 -> Promise<objectURL>，导出时按 key 复用
+
+function staticCoverCacheSupported() {
+  return typeof caches !== "undefined" && location.protocol !== "file:";
+}
+
+function openStaticCoverCache() {
+  if (!staticCoverCacheSupported()) return Promise.resolve(null);
+  if (!staticCoverCachePromise) {
+    staticCoverCachePromise = caches.open(STATIC_COVER_CACHE_NAME).catch(() => null);
+  }
+  return staticCoverCachePromise;
+}
+
+function staticCoverCacheKey(url, version) {
+  return version ? url + "?v=" + encodeURIComponent(version) : url;
+}
+
+// 强缓存取图：命中 → objectURL（零网络）；未命中 → fetch 后写入缓存。
+// 返回 null 表示环境不支持 Cache API，调用方回退直连。
+function loadStaticCoverObjectUrl(url, version) {
+  const cacheKey = staticCoverCacheKey(url, version);
+  if (staticCoverMemo.has(cacheKey)) return staticCoverMemo.get(cacheKey);
+  const task = (async () => {
+    const cache = await openStaticCoverCache();
+    if (!cache) return null;
+    const cached = await cache.match(cacheKey).catch(() => null);
+    if (cached) return URL.createObjectURL(await cached.blob());
+    const res = await fetch(url);
+    if (!res.ok) throw new Error("cover HTTP " + res.status);
+    const copy = res.clone();
+    const blob = await res.blob();
+    try { await cache.put(cacheKey, copy); } catch { /* 配额不足等：不缓存但本次仍可用 */ }
+    return URL.createObjectURL(blob);
+  })();
+  staticCoverMemo.set(cacheKey, task.catch((error) => {
+    staticCoverMemo.delete(cacheKey);
+    throw error;
+  }));
+  return task;
+}
+
+// 清扫与当前清单版本不一致的缓存条目（封面已更新 / 已从数据集移除）。
+// 旧格式清单（无 v 字段）不清扫，避免误删。
+async function sweepStaticCoverCache(coverMap) {
+  const entries = [...coverMap.values()];
+  if (!entries.some((entry) => entry.v)) return;
+  const cache = await openStaticCoverCache();
+  if (!cache) return;
+  const current = new Map(); // pathname -> 期望版本
+  for (const entry of entries) {
+    for (const p of [entry.thumb, entry.orig]) {
+      if (!p) continue;
+      try { current.set(new URL(p, document.baseURI).pathname, entry.v || ""); } catch { /* 忽略非法路径 */ }
+    }
+  }
+  const keys = await cache.keys().catch(() => []);
+  for (const request of keys) {
+    let parsed;
+    try { parsed = new URL(request.url); } catch { continue; }
+    const v = parsed.searchParams.get("v") || "";
+    const want = current.get(parsed.pathname);
+    if (want === undefined || want !== v) cache.delete(request).catch(() => {});
+  }
+}
+
 function communityColor(community, type) {
   if (type === "external") return EXTERNAL_COLOR;
   if (community < 0) return ISOLATED_COLOR;
@@ -187,7 +263,8 @@ function hexToRgba(hex, alpha, premul) {
 
 async function loadGraph(source = null) {
   const url = source ? `${source.base}/graph.json` : GRAPH_URL;
-  const res = await fetch(url, { cache: "no-store" });
+  // no-cache：允许 ETag 304 复验证（GitHub Pages 支持），重复访问免整包重下
+  const res = await fetch(url, { cache: "no-cache" });
   if (!res.ok) throw new Error("加载 graph.json 失败: " + res.status);
   return res.json();
 }
@@ -423,12 +500,12 @@ async function loadCoverManifest(base = "") {
   };
   let data = null;
   try {
-    const res = await fetch(smallUrl, { cache: "no-store" });
+    const res = await fetch(smallUrl, { cache: "no-cache" });
     if (res.ok) data = await res.json();
   } catch (e) { /* 回退到普通清单 */ }
   if (!data) {
     try {
-      const res = await fetch(normalUrl, { cache: "no-store" });
+      const res = await fetch(normalUrl, { cache: "no-cache" });
       if (res.ok) data = await res.json();
     } catch (e) {
       // 清单不存在时由调用方决定是否继续下载或使用纯色节点。
@@ -443,6 +520,7 @@ async function loadCoverManifest(base = "") {
     map.set(k, {
       thumb: pathFor(it.path || `covers/small/${k}.png`),
       orig: pathFor(it.orig || `covers/${k}.jpg`),
+      v: it.v || null, // CI 写入的封面版本（来源 URL 哈希），驱动强缓存失效
     });
   }
   return map;
@@ -480,8 +558,17 @@ function waitForImageSource(source) {
   });
 }
 
-async function loadCoverImageSource(source, localCover = false) {
+async function loadCoverImageSource(source, localCover = false, version = null) {
   const url = new URL(source, document.baseURI).href;
+  if (version) {
+    // 静态封面：Cache API 强缓存优先，命中零网络请求
+    const objectUrl = await loadStaticCoverObjectUrl(url, version);
+    if (objectUrl) {
+      // blob 本地解码校验，统一错误/重试路径（不产生网络请求）
+      await waitForImageSource(objectUrl);
+      return objectUrl;
+    }
+  }
   const isLocalProxy = new URL(url).pathname === "/cover_proxy";
   if (isLocalProxy && !localCover) {
     // 只有缺失本地文件、确实可能访问上游时才进入联网限速队列。
@@ -492,10 +579,10 @@ async function loadCoverImageSource(source, localCover = false) {
   return url;
 }
 
-async function loadCoverObjectUrlWithRetry(source, localCover = false) {
+async function loadCoverObjectUrlWithRetry(source, localCover = false, version = null) {
   for (let attempt = 0; attempt <= COVER_LOAD_RETRIES; attempt++) {
     try {
-      return await loadCoverImageSource(source, localCover);
+      return await loadCoverImageSource(source, localCover, version);
     } catch (error) {
       if (attempt >= COVER_LOAD_RETRIES) throw error;
       await new Promise((resolve) => setTimeout(resolve, 250 * (attempt + 1)));
@@ -543,6 +630,7 @@ function buildGraph(data, coverMap, eagerImages = false) {
       image: eagerImages && cover ? cover.thumb : null,
       thumb: cover ? cover.thumb : null,
       imageSrc: cover ? cover.orig : null, // 原图（导出大图用）
+      coverV: cover ? (cover.v || null) : null, // 封面版本（CI 清单），静态强缓存键
       localCover: !!(cover && cover.local),
       views: n.views,
       favorites: n.favorites,
@@ -553,7 +641,6 @@ function buildGraph(data, coverMap, eagerImages = false) {
       pagerank: n.pagerank,
       community: n.community,
       rank: n.rank,
-      density: n.density,
     });
     if (n.label) {
       const k = n.label.toLowerCase();
@@ -887,6 +974,7 @@ function main() {
         data = await loadGraph();
         setProgress(10, "加载静态封面清单……", "covers/manifest.json");
         coverMap = await loadCoverManifest();
+        sweepStaticCoverCache(coverMap);
       }
       if (!coverMap) {
         if (localServer.mode === "upstream") {
@@ -908,6 +996,7 @@ function main() {
       await new Promise((r) => setTimeout(r, 30));
       // 封面：CI 预生成后随站点静态发布；清单缺失时回退为纯色节点。
       coverMap = await loadCoverManifest();
+      sweepStaticCoverCache(coverMap);
     }
     renderMetaPanel(data.meta);
     setProgress(20, coverMap.size
@@ -1050,7 +1139,7 @@ function main() {
         if (state.status !== "queued") continue;
         state.status = "loading";
         activeCoverLoads += 1;
-        loadCoverObjectUrlWithRetry(item.src, item.local)
+        loadCoverObjectUrlWithRetry(item.src, item.local, item.version)
           .then((imageSource) => {
             if (!imageSource) throw new Error("empty image");
             state.status = "ready";
@@ -1093,7 +1182,7 @@ function main() {
         state.priority = (insideViewport ? 0 : 1e9) + centerDistance;
         if (state.status === "idle") {
           state.status = "queued";
-          coverQueue.push({ key, src: attrs.thumb, local: !!attrs.localCover });
+          coverQueue.push({ key, src: attrs.thumb, local: !!attrs.localCover, version: attrs.coverV || null });
         }
       });
 
@@ -1424,7 +1513,7 @@ function main() {
     lines.push("<div class='tt-meta'>" + (attrs.kind === "core" ? "核心模组" : "外部引用") + " · " + escapeHtml(attrs.category || "无分类") + "</div>");
     if (attrs.status) lines.push("<div class='tt-meta'>状态：" + escapeHtml(attrs.status) + "</div>");
     lines.push("<div class='tt-stats'>浏览量 " + formatNum(attrs.views) + " · 收藏 " + formatNum(attrs.favorites) + "</div>");
-    lines.push("<div class='tt-stats'>被依赖 " + attrs.in_degree + " · 依赖 " + attrs.out_degree + " · PageRank " + attrs.pagerank.toFixed(5) + "</div>");
+    lines.push("<div class='tt-stats'>被依赖 " + attrs.in_degree + " · 依赖 " + attrs.out_degree + " · PageRank " + (attrs.pagerank ?? 0).toFixed(5) + "</div>");
     lines.push("<div class='tt-hint'>点击跳转 mcmod 页面</div>");
     tooltipEl.innerHTML = lines.join("");
     tooltipEl.classList.remove("hidden");
@@ -1466,9 +1555,9 @@ function main() {
       const now = performance.now();
       if (now - lastAltPress < ALT_DOUBLE_MS) {
         lastAltPress = 0;
-        if (panel.classList.contains("collapsed") || panel.style.display === "none") {
-          panel.style.display = panel.style.display === "none" ? "" : "none";
-        }
+        // 双击 Alt 完整显示/隐藏侧边栏（与“折叠”按钮的 collapsed 类互不干扰：
+        // 隐藏优先于折叠，恢复时回到隐藏前的折叠状态）
+        panel.style.display = panel.style.display === "none" ? "" : "none";
       } else {
         lastAltPress = now;
       }
@@ -2007,8 +2096,19 @@ function main() {
         let img = null;
         const src = attrs.imageSrc || attrs.image; // 导出优先原图（缩略图仅用于屏幕渲染）
         if (src) {
+          let resolved = src;
+          if (attrs.coverV) {
+            // 导出同样走强缓存：原图一次缓存后，后续导出零网络请求
+            const objectUrl = await loadStaticCoverObjectUrl(
+              new URL(src, document.baseURI).href, attrs.coverV,
+            ).catch(() => null);
+            if (objectUrl) resolved = objectUrl;
+          }
           img = new Image();
-          img.src = src;
+          // 本地 proxy 资源是跨域（ACAO *）；不声明 anonymous 会污染 canvas，
+          // 导出 toBlob 时抛 SecurityError
+          img.crossOrigin = "anonymous";
+          img.src = resolved;
           await new Promise((resolve) => {
             img.onload = resolve;
             img.onerror = resolve;

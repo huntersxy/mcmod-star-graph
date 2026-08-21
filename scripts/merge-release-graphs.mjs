@@ -96,9 +96,11 @@ for (const name of await readdir(cacheDir)) {
 // 仅存在于旧发行版的节点/边原样保留（并集语义）。
 const nodes = new Map();
 const edges = new Map();
+let latestMeta = null; // 最新一份 release 的 meta（标题等展示字段）
 for (const item of items) {
   const file = await ensureAsset(item.url, item.name);
   const g = JSON.parse(await readFile(file, "utf8"));
+  if (g.meta) latestMeta = g.meta;
   for (const n of g.nodes || []) {
     const key = String(n.key);
     const prev = nodes.get(key);
@@ -115,13 +117,27 @@ const mergedNodes = [...nodes.values()].sort((a, b) => cmpKeys(String(a.key), St
 const mergedEdges = [...edges.values()].sort(
   (a, b) => cmpKeys(String(a.source), String(b.source)) || cmpKeys(String(a.target), String(b.target)),
 );
+const coreNodeCount = mergedNodes.filter((n) => (n.type || "core") === "core").length;
+const dependencyEdges = mergedEdges.filter((e) => e.type !== "interaction").length;
+const interactionEdges = mergedEdges.length - dependencyEdges;
+const communityCount = new Set(mergedNodes.map((n) => n.community).filter((c) => typeof c === "number" && c >= 0)).size;
+const componentCount = new Set(mergedNodes.map((n) => n.component).filter((c) => c != null)).size;
+const mergedAt = new Date().toISOString();
 const graph = {
   meta: {
+    // 前端 renderMetaPanel 读取的展示字段（来自最新 release 的标题 + 合并统计）
+    title: latestMeta?.title || "NeoForge 1.21.1 生态关系图",
+    node_count: mergedNodes.length,
+    edge_count: mergedEdges.length,
+    core_node_count: coreNodeCount,
+    dependency_edges: dependencyEdges,
+    interaction_edges: interactionEdges,
+    community_count: communityCount,
+    component_count: componentCount,
+    generated_at: mergedAt,
     source: `https://github.com/${OWNER}/${REPO}/releases`,
     mergedFrom: items.map((i) => i.name),
-    nodeCount: mergedNodes.length,
-    edgeCount: mergedEdges.length,
-    mergedAt: new Date().toISOString(),
+    mergedAt,
   },
   nodes: mergedNodes,
   edges: mergedEdges,

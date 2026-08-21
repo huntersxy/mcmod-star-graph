@@ -5,6 +5,7 @@
 // （跨构建由 GitHub Actions cache 持久化 covers/ 目录）。
 // 用法：COVER_LIMIT=50 COVER_CONCURRENCY=12 node scripts/prepare-covers.mjs
 import { access, mkdir, readFile, writeFile, readdir, unlink, rename, stat } from "node:fs/promises";
+import { createHash } from "node:crypto";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -127,11 +128,16 @@ const workers = Array.from(
 );
 await Promise.all(workers);
 
+// 封面版本号：来源 URL 的短哈希。CI 资产路径按 key 命名（内容可变），
+// 版本号随清单下发供前端做 Cache API 强缓存键：URL 未变 → 键不变 →
+// 老用户零请求；URL 变化 → 键变化 → 自动重新拉取。
+const versionOf = (url) => createHash("sha1").update(url).digest("hex").slice(0, 12);
+
 const items = {};
 for (const node of selected) {
   const key = String(node.key);
   const item = reusable.get(key) || downloaded.get(key);
-  if (item) items[key] = { url: item.url, path: `covers/${key}.jpg`, bytes: item.bytes };
+  if (item) items[key] = { url: item.url, path: `covers/${key}.jpg`, bytes: item.bytes, v: versionOf(item.url) };
 }
 const keys = Object.keys(items).sort((a, b) => Number(a) - Number(b));
 await writeFile(
