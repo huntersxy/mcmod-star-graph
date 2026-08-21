@@ -437,10 +437,10 @@ class Handler(SimpleHTTPRequestHandler):
         if key and not re.fullmatch(r"\d+", key):
             self.send_error(400, "invalid key")
             return
+        url = _normalize_cover_url(url)
         if not self._is_allowed(url):
             self.send_error(403, "host not allowed")
             return
-        url = _normalize_cover_url(url)
         persist = _SERVER_MODE == "enhanced" and bool(key)
         target = COVERS_DIR / f"{key}.jpg" if persist else None
         content_type = "image/jpeg"
